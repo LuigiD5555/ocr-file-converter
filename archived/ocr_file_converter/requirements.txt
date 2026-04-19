@@ -1,0 +1,23 @@
+############################
+# OCR File Converter - Core dependencies
+############################
+
+# === CORE ===
+python-docx>=1.1
+pypdf>=4.0
+python-dotenv>=1.0
+
+# === HTTP / API ===
+requests>=2.31
+fastapi>=0.104
+pydantic>=2.0
+
+# === OPTIONAL: Better PDF performance ===
+# Uncomment if you need faster PDF parsing for large/complex PDFs
+# pymupdf>=1.23
+
+# === OPTIONAL: Telemetry ===
+# Uncomment to enable error reporting and monitoring
+# sentry-sdk>=1.35
+# opentelemetry-api>=1.20
+# opentelemetry-sdk>=1.20

@@ -1,0 +1,21 @@
+services:
+  ocr-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ocr-service
+    ports:
+      - "8000:8000"
+    environment:
+      - WORK_DIR=/work
+      - PORT=8000
+    volumes:
+      - /tmp:/work
+      - /mnt/Documents:/mnt/Documents:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
