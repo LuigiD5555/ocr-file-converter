@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from src.errors import SerializationError
 from src.layout import ImageLayoutReconstructor
+from src.layout_block_ocr import extract_text_by_blocks
 from src.logging import get_logger
 
 log = get_logger(__name__)
@@ -201,10 +202,13 @@ class TextNormalizer:
         if source.suffix.lower() not in {".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".webp"}:
             return None
 
-        line_count = text.count("\n") + 1
         word_count = len(text.split())
-        if line_count > 6 or word_count < 12:
+        if word_count < 12:
             return None
+
+        block_result = extract_text_by_blocks(str(source))
+        if block_result and block_result.count("\n") > text.count("\n") + 2:
+            return block_result
 
         reconstructed = self.layout_reconstructor.reconstruct(source, anchors=layout_anchors)
         if not reconstructed:
