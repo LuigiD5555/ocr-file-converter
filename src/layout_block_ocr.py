@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import List
 
 import cv2
+import numpy as np
 
 from src.logging import get_logger
 
@@ -31,20 +32,6 @@ class BoundingBox:
         horizontal = not (self.x2 < other.x or self.x > other.x2)
         vertical = not (self.y2 < other.y or self.y > other.y2)
         return horizontal and vertical
-
-    def is_vertically_close(self, other: "BoundingBox", threshold: int) -> bool:
-        """Check if box is vertically close to another."""
-        if self.y > other.y2:
-            gap = self.y - other.y2
-        elif other.y > self.y2:
-            gap = other.y - self.y2
-        else:
-            return True
-        return gap <= threshold
-
-    def is_horizontally_aligned(self, other: "BoundingBox", threshold: int) -> bool:
-        """Check if boxes are horizontally aligned."""
-        return abs(self.x - other.x) <= threshold or abs(self.x2 - other.x2) <= threshold
 
     def merge(self, other: "BoundingBox") -> "BoundingBox":
         """Merge with another box."""
@@ -128,9 +115,8 @@ def extract_text_by_blocks(image_path: str) -> str:
 
 
 def _detect_text_blocks(image) -> List[BoundingBox]:
-    """Detect text blocks using grid-based processing."""
+    """Detect text blocks using horizontal/vertical projection analysis."""
     height, width = image.shape[:2]
-    original_width = width
 
     scale_factor = 1
     if width < 1200:
@@ -141,34 +127,69 @@ def _detect_text_blocks(image) -> List[BoundingBox]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+    _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (10, 10))
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_DILATE, kernel)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
 
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    horizontal_projection = np.sum(thresh, axis=1)
+    vertical_projection = np.sum(thresh, axis=0)
 
-    min_area = 1500
+    horizontal_threshold = np.mean(horizontal_projection) * 0.05
+    vertical_threshold = np.mean(vertical_projection) * 0.05
+
+    h_breaks = _find_breaks(horizontal_projection, horizontal_threshold)
+    v_breaks = _find_breaks(vertical_projection, vertical_threshold)
+
+    log.debug("Horizontal breaks: %d, Vertical breaks: %d", len(h_breaks), len(v_breaks))
+
     boxes = []
-    for contour in contours:
-        x, y, w, h = cv2.boundingRect(contour)
-        area = w * h
-        if area >= min_area and w > 40 and h > 25:
-            if scale_factor > 1:
-                x = x // scale_factor
-                y = y // scale_factor
-                w = w // scale_factor
-                h = h // scale_factor
-            box = BoundingBox(x, y, w, h)
-            boxes.append(box)
+    for h_start, h_end in h_breaks:
+        for v_start, v_end in v_breaks:
+            region = thresh[h_start:h_end, v_start:v_end]
+            if np.sum(region) > 200:
+                if scale_factor > 1:
+                    h_start = h_start // scale_factor
+                    h_end = h_end // scale_factor
+                    v_start = v_start // scale_factor
+                    v_end = v_end // scale_factor
 
-    log.debug("Found %d initial contours", len(boxes))
+                box = BoundingBox(v_start, h_start, v_end - v_start, h_end - h_start)
+                boxes.append(box)
+
+    log.debug("Found %d blocks via projection", len(boxes))
 
     merged_boxes = _merge_nearby_boxes(boxes)
     log.debug("Merged to %d boxes", len(merged_boxes))
 
+    if len(merged_boxes) < 2:
+        log.debug("Too few blocks found, falling back to original image")
+        return []
+
     sorted_boxes = _sort_reading_order(merged_boxes)
     return sorted_boxes
+
+
+def _find_breaks(projection, threshold: float) -> List[tuple]:
+    """Find continuous regions (breaks between white space) in projection."""
+    in_region = False
+    start = 0
+    regions = []
+
+    for idx, value in enumerate(projection):
+        if value > threshold:
+            if not in_region:
+                start = idx
+                in_region = True
+        else:
+            if in_region:
+                regions.append((start, idx))
+                in_region = False
+
+    if in_region:
+        regions.append((start, len(projection)))
+
+    return regions
 
 
 def _merge_nearby_boxes(boxes: List[BoundingBox]) -> List[BoundingBox]:
@@ -207,8 +228,10 @@ def _merge_nearby_boxes(boxes: List[BoundingBox]) -> List[BoundingBox]:
 
 def _sort_reading_order(boxes: List[BoundingBox]) -> List[BoundingBox]:
     """Sort boxes by reading order (top-to-bottom, left-to-right)."""
-    row_threshold = 30
+    if not boxes:
+        return []
 
+    row_threshold = 30
     sorted_boxes = sorted(boxes, key=lambda b: (b.y, b.x))
 
     rows = []
