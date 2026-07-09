@@ -1,12 +1,14 @@
 """Contour-based text block detection and OCR for multi-block images."""
 
+import os
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import cv2
 import numpy as np
 
 from src.logging import get_logger
+from src.reading_order import ReadingOrderConfig, order_boxes
 
 log = get_logger(__name__)
 
@@ -46,23 +48,36 @@ class BoundingBox:
         return self.width * self.height
 
 
-def extract_text_by_blocks(image_path: str) -> str:
+def extract_text_by_blocks(image_path: str, reading_order: Optional[str] = None) -> str:
     """
     Extracts structured text from an image by detecting visual text blocks,
     performing OCR per block, and reconstructing reading order.
 
-    This function uses contour detection to identify separate text regions
-    (e.g., in infographics, multi-column layouts, or UI screenshots). If
-    fewer than 3 blocks are detected, returns empty string to signal the
-    caller to use alternative OCR strategies. The caller (normalizer) will
-    then fall back to the existing ImageLayoutReconstructor approach.
+    This function uses contour/projection detection to identify separate text
+    regions (e.g., in infographics, triptychs, multi-column layouts, or UI
+    screenshots). The detected boxes are ordered through configurable reading
+    strategies instead of assuming only top-to-bottom + left-to-right.
+
+    Reading order can be passed explicitly or through OCR_READING_ORDER:
+
+    - auto
+    - ltr-tb
+    - rtl-tb
+    - tb-lr
+    - tb-rl
+    - bu-lr
+    - bu-rl
+    - triptych-ltr
+    - triptych-rtl
+    - triptych-bottom-up
 
     Args:
         image_path (str): Path to the input image.
+        reading_order: Optional reading order strategy.
 
     Returns:
-        str: Structured text output with block separation via "\\n\\n",
-             or empty string if block detection fails or fewer than 3 blocks found.
+        str: Structured text output with block separation via "\n\n",
+             or empty string if block detection fails.
     """
     if pytesseract is None:
         log.warning("pytesseract not available, cannot extract text by blocks")
@@ -82,7 +97,8 @@ def extract_text_by_blocks(image_path: str) -> str:
         height, width = image.shape[:2]
         log.debug("Image loaded: %dx%d", width, height)
 
-        blocks = _detect_text_blocks(image)
+        strategy = reading_order or os.getenv("OCR_READING_ORDER", "auto")
+        blocks = _detect_text_blocks(image, reading_order=strategy)
         if not blocks:
             log.debug("No text blocks detected in %s", image_path)
             return ""
@@ -106,7 +122,7 @@ def extract_text_by_blocks(image_path: str) -> str:
             return ""
 
         result = "\n\n".join(block_texts)
-        log.info("Extracted %d blocks from %s", len(block_texts), image_path)
+        log.info("Extracted %d blocks from %s using reading_order=%s", len(block_texts), image_path, strategy)
         return result
 
     except Exception as exc:
@@ -114,9 +130,10 @@ def extract_text_by_blocks(image_path: str) -> str:
         return ""
 
 
-def _detect_text_blocks(image) -> List[BoundingBox]:
+def _detect_text_blocks(image, reading_order: str = "auto") -> List[BoundingBox]:
     """Detect text blocks using horizontal/vertical projection analysis."""
     height, width = image.shape[:2]
+    original_height, original_width = height, width
 
     scale_factor = 1
     if width < 1200:
@@ -149,12 +166,22 @@ def _detect_text_blocks(image) -> List[BoundingBox]:
             region = thresh[h_start:h_end, v_start:v_end]
             if np.sum(region) > 200:
                 if scale_factor > 1:
-                    h_start = h_start // scale_factor
-                    h_end = h_end // scale_factor
-                    v_start = v_start // scale_factor
-                    v_end = v_end // scale_factor
+                    scaled_h_start = h_start // scale_factor
+                    scaled_h_end = h_end // scale_factor
+                    scaled_v_start = v_start // scale_factor
+                    scaled_v_end = v_end // scale_factor
+                else:
+                    scaled_h_start = h_start
+                    scaled_h_end = h_end
+                    scaled_v_start = v_start
+                    scaled_v_end = v_end
 
-                box = BoundingBox(v_start, h_start, v_end - v_start, h_end - h_start)
+                box = BoundingBox(
+                    scaled_v_start,
+                    scaled_h_start,
+                    scaled_v_end - scaled_v_start,
+                    scaled_h_end - scaled_h_start,
+                )
                 boxes.append(box)
 
     log.debug("Found %d blocks via projection", len(boxes))
@@ -166,7 +193,7 @@ def _detect_text_blocks(image) -> List[BoundingBox]:
         log.debug("Too few blocks found, falling back to original image")
         return []
 
-    sorted_boxes = _sort_reading_order(merged_boxes)
+    sorted_boxes = _sort_reading_order(merged_boxes, original_width, original_height, reading_order)
     return sorted_boxes
 
 
@@ -226,36 +253,18 @@ def _merge_nearby_boxes(boxes: List[BoundingBox]) -> List[BoundingBox]:
     return merged
 
 
-def _sort_reading_order(boxes: List[BoundingBox]) -> List[BoundingBox]:
-    """Sort boxes by reading order (top-to-bottom, left-to-right)."""
+def _sort_reading_order(
+    boxes: List[BoundingBox],
+    page_width: int,
+    page_height: int,
+    reading_order: str = "auto",
+) -> List[BoundingBox]:
+    """Sort boxes using configurable reading-order strategies."""
     if not boxes:
         return []
 
-    row_threshold = 30
-    sorted_boxes = sorted(boxes, key=lambda b: (b.y, b.x))
-
-    rows = []
-    current_row = [sorted_boxes[0]]
-    current_row_y = sorted_boxes[0].y
-
-    for box in sorted_boxes[1:]:
-        if abs(box.y - current_row_y) <= row_threshold:
-            current_row.append(box)
-        else:
-            current_row.sort(key=lambda b: b.x)
-            rows.append(current_row)
-            current_row = [box]
-            current_row_y = box.y
-
-    if current_row:
-        current_row.sort(key=lambda b: b.x)
-        rows.append(current_row)
-
-    result = []
-    for row in rows:
-        result.extend(row)
-
-    return result
+    config = ReadingOrderConfig(strategy=reading_order or "auto")
+    return list(order_boxes(boxes, page_width=page_width, page_height=page_height, config=config))
 
 
 def _ocr_block(block_image) -> str:
